@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cxxabi.h>
 #include <format>
+#include <typeindex>
+#include <unordered_map>
 #include <vector>
 
 namespace nostd {
@@ -153,6 +155,7 @@ template <class World, class... Ts> struct query_iterator {
 
   std::array<std::size_t, sizeof...(Ts)> offsets;
   std::size_t stride;
+  World *world;
 
   query_iterator &operator++() {
     archetype_cur += stride;
@@ -172,7 +175,7 @@ template <class World, class... Ts> struct query_iterator {
     }
 
     stride = archetypes_vector_cur->tinfo.size;
-    offsets = {World::template offset_in<Ts>(archetypes_vector_cur->types)...};
+    offsets = {world->template offset_in<Ts>(archetypes_vector_cur->types)...};
     archetype_cur = archetypes_vector_cur->begin();
     archetype_end = archetypes_vector_cur->end();
     return *this;
@@ -206,6 +209,7 @@ template <class World, class... Ts> struct query_iterator {
         nullptr,
         {},
         0,
+        world,
     };
   }
 };
@@ -213,14 +217,46 @@ template <class World, class... Ts> struct query_iterator {
 template <class T>
 concept trivial = std::is_trivial_v<T>;
 
-template <trivial... Cs> class basic_world {
-public:
-  static constexpr size_t N = sizeof...(Cs);
+template <trivial... Cs> struct StaticRegistry {
   using components_t = nostd::typelist<Cs...>;
-  using type_set = std::bitset<N>;
-  using Archetype = Archetype<N>;
+  static constexpr std::size_t max_components = sizeof...(Cs);
+  static constexpr std::array sizes = {
+      sizeof(Cs)...,
+  };
 
-  template <component<components_t>... Ts> auto query() {
+  std::size_t size(std::size_t type_index) const { return sizes[type_index]; }
+
+  template <component<components_t> T> std::size_t index() const {
+    return nostd::index_of_v<T, components_t>;
+  }
+};
+
+template <const std::size_t N> struct DynamicRegistry {
+  static constexpr std::size_t max_components = N;
+  nostd::stack_vector<std::size_t, N> sizes;
+  std::unordered_map<std::type_index, std::size_t> type_map;
+  std::size_t next_id = 0;
+
+  std::size_t size(std::size_t type_index) const { return sizes[type_index]; }
+
+  template <class T> std::size_t index() const {
+    return type_map.at(std::type_index(typeid(T)));
+  }
+
+  template <class T> void register_type() {
+        const std::size_t type_index = next_id++;
+    type_map[std::type_index(typeid(T))] = type_index;
+    sizes[type_index] = sizeof(T);
+  }
+};
+
+template <class Registry> class basic_world {
+public:
+  using type_set = std::bitset<Registry::max_components>;
+  using Archetype = Archetype<Registry::max_components>;
+  Registry registry;
+
+  template <class... Ts> auto query() {
     if (archetypes_.empty()) {
       return query_iterator<basic_world, Ts...>{
           as_type_set<Ts...>(),
@@ -230,20 +266,21 @@ public:
           nullptr,
           {},
           0,
+          this,
       };
     }
     return query_iterator<basic_world, Ts...>{
         as_type_set<Ts...>(),      archetypes_.begin(),
         archetypes_.end(),         archetypes_[0].begin(),
         archetypes_[0].end(),      {offset_in<Ts>(archetypes_[0].types)...},
-        archetypes_[0].tinfo.size,
+        archetypes_[0].tinfo.size, this,
     };
   }
 
-  template <component<components_t>... Ts> void insert(Ts &&...ts) {
+  template <class... Ts> void insert(Ts &&...ts) {
     constexpr std::size_t N = sizeof(std::tuple<Ts...>);
     std::array<std::byte, N> data;
-    constexpr auto types = as_type_set<Ts...>();
+    auto types = as_type_set<Ts...>();
 
     (
         [&] {
@@ -273,25 +310,20 @@ public:
     return archetypes_.back();
   }
 
-  template <component<components_t>... Ts>
-  static consteval type_set as_type_set() {
-    std::array<size_t, sizeof...(Ts)> v{nostd::index_of_v<Ts, components_t>...};
-    std::bitset<N> b;
+  template <class... Ts> constexpr type_set as_type_set() {
+    std::array<size_t, sizeof...(Ts)> v{registry.template index<Ts>()...};
+    std::bitset<Registry::max_components> b;
     for (const auto index : v) {
       b |= 1 << index;
     }
     return b;
   }
 
-  template <component<components_t> T>
-  static constexpr std::size_t offset_in(type_set types) {
+  template <class T> constexpr std::size_t offset_in(type_set types) {
     std::size_t offset = 0;
-    std::array sizes = {
-        sizeof(Cs)...,
-    };
-    for (std::size_t i = 0; i < nostd::index_of_v<T, components_t>; i++) {
+    for (std::size_t i = 0; i < registry.template index<T>(); i++) {
       if (types.test(i)) {
-        offset += sizes[i];
+        offset += registry.size(i);
       }
     }
     return offset;
@@ -300,7 +332,7 @@ public:
 
 template <class T> struct basic_world_from_list {};
 template <class... Tn> struct basic_world_from_list<nostd::typelist<Tn...>> {
-  using type = basic_world<Tn...>;
+  using type = basic_world<StaticRegistry<Tn...>>;
 };
 
 template <class T>
@@ -327,9 +359,13 @@ using components = nostd::typelist<pos, speed, another_thing>;
 } // namespace components
 
 using World = ecs::basic_world_from_list_t<components::components>;
+using DynamicWorld = ecs::basic_world<ecs::DynamicRegistry<8>>;
 
 int main() {
-  World world;
+  DynamicWorld world;
+  world.registry.register_type<components::pos>();
+  world.registry.register_type<components::speed>();
+  world.registry.register_type<components::another_thing>();
 
   nostd::println("World is {}", nostd::type_name<World>());
   for (size_t i = 0; i < 1024; i++) {
