@@ -7,8 +7,9 @@
 #include <cstring>
 #include <cxxabi.h>
 #include <format>
+#include <iterator>
 #include <typeindex>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nostd {
@@ -57,25 +58,27 @@ template <class T> char *type_name() {
   return abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, nullptr);
 }
 
+template <class T> union MaybeUninit {
+  std::array<std::byte, sizeof(T)> uninit;
+  T data;
+  MaybeUninit() : uninit() {}
+};
+
 template <class T, const std::size_t N> class stack_vector {
 private:
-  std::array<T, N> data_;
+  std::array<MaybeUninit<T>, N> data_;
   std::size_t size_ = 0;
 
 public:
   using value_type = T;
-  using iterator = decltype(data_)::iterator;
-  using const_iterator = decltype(data_)::const_iterator;
 
   constexpr std::size_t size() const { return size_; };
-  constexpr auto data() const { return data_.data(); };
-  constexpr auto begin() { return data_.begin(); };
-  constexpr auto end() { return data_.begin() + size_; };
-  constexpr auto cbegin() const { return data_.cbegin(); };
-  constexpr auto cend() const { return data_.cbegin() + size_; };
+  constexpr auto data() const { return reinterpret_cast<T *>(data_.data()); };
+  constexpr auto begin() { return reinterpret_cast<T *>(data_.begin()); };
+  constexpr auto end() { return reinterpret_cast<T *>(data_.begin() + size_); };
 
   constexpr const auto &operator[](std::size_t index) const {
-    return data_[index];
+    return data_[index].data;
   };
   constexpr auto &operator[](std::size_t index) { return data_[index]; };
   constexpr void resize(std::size_t size) {
@@ -84,7 +87,7 @@ public:
   }
   constexpr void push_back(T &&t) {
     assert(size_ < N);
-    data_[size_] = std::move(t);
+    data_[size_].data = std::move(t);
     size_ += 1;
   }
 };
@@ -144,7 +147,7 @@ template <const std::size_t N> struct Archetype {
 
 template <class World, class... Ts> struct query_iterator {
   using archetypes_vector_iterator =
-      std::vector<typename World::Archetype>::iterator;
+      std::vector<typename World::archetype>::iterator;
 
   typename World::type_set types;
   archetypes_vector_iterator archetypes_vector_cur;
@@ -233,27 +236,34 @@ template <trivial... Cs> struct StaticRegistry {
 
 template <const std::size_t N> struct DynamicRegistry {
   static constexpr std::size_t max_components = N;
-  nostd::stack_vector<std::size_t, N> sizes;
-  std::unordered_map<std::type_index, std::size_t> type_map;
-  std::size_t next_id = 0;
+  struct RegistryEntry {
+    std::type_index type_idx;
+    size_t size;
+  };
+  nostd::stack_vector<RegistryEntry, N> entries{};
 
-  std::size_t size(std::size_t type_index) const { return sizes[type_index]; }
+  std::size_t size(std::size_t idx) const { return entries[idx].size; }
 
-  template <class T> std::size_t index() const {
-    return type_map.at(std::type_index(typeid(T)));
-  }
+  template <class T> std::size_t index() { return register_type<T>(); }
 
-  template <class T> void register_type() {
-        const std::size_t type_index = next_id++;
-    type_map[std::type_index(typeid(T))] = type_index;
-    sizes[type_index] = sizeof(T);
+  template <class T> std::size_t register_type() {
+    const std::type_index key(typeid(T));
+    if (const auto it =
+            std::ranges::find(entries, key, &RegistryEntry::type_idx);
+        it != entries.end()) {
+      return std::distance(entries.begin(), it);
+    }
+
+    assert(entries.size() < N);
+    entries.push_back({key, sizeof(T)});
+    return entries.size() - 1;
   }
 };
 
 template <class Registry> class basic_world {
 public:
   using type_set = std::bitset<Registry::max_components>;
-  using Archetype = Archetype<Registry::max_components>;
+  using archetype = Archetype<Registry::max_components>;
   Registry registry;
 
   template <class... Ts> auto query() {
@@ -297,9 +307,9 @@ public:
   }
 
   /* private: */
-  std::vector<Archetype> archetypes_;
+  std::vector<archetype> archetypes_;
 
-  Archetype &find_or_insert_archetype(type_set types, type_info tinfo) {
+  archetype &find_or_insert_archetype(type_set types, type_info tinfo) {
     for (auto &archetype : archetypes_) {
       if (archetype.types == types) {
         return archetype;
@@ -363,9 +373,6 @@ using DynamicWorld = ecs::basic_world<ecs::DynamicRegistry<8>>;
 
 int main() {
   DynamicWorld world;
-  world.registry.register_type<components::pos>();
-  world.registry.register_type<components::speed>();
-  world.registry.register_type<components::another_thing>();
 
   nostd::println("World is {}", nostd::type_name<World>());
   for (size_t i = 0; i < 1024; i++) {
