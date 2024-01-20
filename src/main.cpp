@@ -1,13 +1,16 @@
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <bitset>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cxxabi.h>
 #include <format>
 #include <iterator>
+#include <tuple>
 #include <typeindex>
 #include <utility>
 #include <vector>
@@ -95,6 +98,20 @@ public:
 } // namespace nostd
 
 namespace ecs {
+
+enum class entity_t : uint64_t {};
+
+struct entity_info {
+  uint16_t generation;
+  uint16_t archetype;
+  uint32_t idx;
+
+  entity_t into_entity_t() { return std::bit_cast<entity_t>(*this); }
+  static entity_info from_entity_t(entity_t ent) {
+    return std::bit_cast<entity_info>(ent);
+  }
+};
+
 template <class A, class Components>
 concept component = nostd::contains_v<A, Components>;
 
@@ -116,11 +133,13 @@ template <const std::size_t N> struct Archetype {
                                              std::byte[capacity * tinfo.size]) {
   }
 
-  void insert(std::span<const std::byte> src) {
+  std::size_t insert(std::span<const std::byte> src) {
     assert(src.size_bytes() == tinfo.size);
     auto dst = at(size);
     std::copy(src.begin(), src.end(), dst.begin());
-    size++;
+    ++size;
+
+    return size - 1;
   }
 
   ~Archetype() { delete[] data; }
@@ -145,42 +164,67 @@ template <const std::size_t N> struct Archetype {
   auto end() { return data + size * tinfo.size; }
 };
 
-template <class World, class... Ts> struct query_iterator {
+template <class... Ts> struct entity_getter {
+  static std::tuple<Ts &...>
+  from_data_offsets(std::byte *data,
+                    std::array<std::size_t, sizeof...(Ts)> offsets) {
+    std::size_t i = 0;
+    return {
+
+        ([&]() -> Ts & {
+          return (*reinterpret_cast<Ts *>(data + offsets[i++]));
+        }())...,
+    };
+  }
+};
+
+template <class World, class... Ts> class query_iterator {
   using archetypes_vector_iterator =
       std::vector<typename World::archetype>::iterator;
 
-  typename World::type_set types;
-  archetypes_vector_iterator archetypes_vector_cur;
-  archetypes_vector_iterator archetypes_vector_end;
+  struct M {
+    typename World::type_set types;
+    archetypes_vector_iterator archetypes_vector_cur;
+    archetypes_vector_iterator archetypes_vector_end;
 
-  std::byte *archetype_cur;
-  std::byte *archetype_end;
+    std::byte *archetype_cur;
+    std::byte *archetype_end;
 
-  std::array<std::size_t, sizeof...(Ts)> offsets;
-  std::size_t stride;
-  World *world;
+    std::array<std::size_t, sizeof...(Ts)> offsets;
+    std::size_t stride;
+    World *world;
 
+    friend auto operator<=>(const M &a, const M &b) = default;
+  } m;
+
+  query_iterator(M m) : m(m) {}
+
+public:
   query_iterator &operator++() {
-    archetype_cur += stride;
-    if (archetype_cur != archetype_end) {
-      return *this;
+    if (m.archetype_cur != nullptr) {
+      m.archetype_cur += m.stride;
+      if (m.archetype_cur != m.archetype_end) {
+        return *this;
+      }
+
+      ++m.archetypes_vector_cur;
     }
 
-    // find next archetype
-    ++archetypes_vector_cur;
-    while (archetypes_vector_cur != archetypes_vector_end &&
-           (archetypes_vector_cur->types & types) != types) {
-      ++archetypes_vector_cur;
+    // Find next useful archetype
+    while (m.archetypes_vector_cur != m.archetypes_vector_end &&
+           (m.archetypes_vector_cur->types & m.types) != m.types) {
+      ++m.archetypes_vector_cur;
     }
-    if (archetypes_vector_cur == archetypes_vector_end) {
+    if (m.archetypes_vector_cur == m.archetypes_vector_end) {
       *this = end();
       return *this;
     }
 
-    stride = archetypes_vector_cur->tinfo.size;
-    offsets = {world->template offset_in<Ts>(archetypes_vector_cur->types)...};
-    archetype_cur = archetypes_vector_cur->begin();
-    archetype_end = archetypes_vector_cur->end();
+    m.stride = m.archetypes_vector_cur->tinfo.size;
+    m.offsets = {
+        m.world->template offset_in<Ts>(m.archetypes_vector_cur->types)...};
+    m.archetype_cur = m.archetypes_vector_cur->begin();
+    m.archetype_end = m.archetypes_vector_cur->end();
     return *this;
   }
 
@@ -191,30 +235,33 @@ template <class World, class... Ts> struct query_iterator {
   }
 
   std::tuple<Ts &...> operator*() {
-    std::size_t i = 0;
-    return {
-        ([&]() -> Ts & {
-          return *reinterpret_cast<Ts *>(archetype_cur + offsets[i++]);
-        }())...,
-    };
+    return entity_getter<Ts...>::from_data_offsets(m.archetype_cur, m.offsets);
   }
 
   friend auto operator<=>(const query_iterator &a,
                           const query_iterator &b) = default;
 
-  auto begin() { return *this; }
-  auto end() {
-    return query_iterator{
-        types,
-        archetypes_vector_end,
-        archetypes_vector_end,
+  query_iterator begin() { return *this; }
+  query_iterator end() {
+    return M{
+        m.types,
+        m.archetypes_vector_end,
+        m.archetypes_vector_end,
         nullptr,
         nullptr,
         {},
         0,
-        world,
+        m.world,
     };
   }
+
+  query_iterator(World *world)
+      : m{
+            .types = world->template as_type_set<Ts...>(),
+            .archetypes_vector_cur = world->archetypes_.begin(),
+            .archetypes_vector_end = world->archetypes_.end(),
+            .world = world,
+        } {}
 };
 
 template <class T>
@@ -267,27 +314,26 @@ public:
   Registry registry;
 
   template <class... Ts> auto query() {
-    if (archetypes_.empty()) {
-      return query_iterator<basic_world, Ts...>{
-          as_type_set<Ts...>(),
-          archetypes_.begin(),
-          archetypes_.end(),
-          nullptr,
-          nullptr,
-          {},
-          0,
-          this,
-      };
-    }
-    return query_iterator<basic_world, Ts...>{
-        as_type_set<Ts...>(),      archetypes_.begin(),
-        archetypes_.end(),         archetypes_[0].begin(),
-        archetypes_[0].end(),      {offset_in<Ts>(archetypes_[0].types)...},
-        archetypes_[0].tinfo.size, this,
+    return ++query_iterator<basic_world, Ts...>{
+        this,
     };
   }
 
-  template <class... Ts> void insert(Ts &&...ts) {
+  template <class... Ts> auto entity(const entity_t ent) {
+    const auto ent_info = entity_info::from_entity_t(ent);
+
+    auto &archetype = archetypes_[ent_info.archetype];
+    const auto needed = as_type_set<Ts...>();
+    assert((needed & archetype.types) == needed);
+
+    return entity_getter<Ts...>::from_data_offsets(
+        archetype.at(ent_info.idx).data(),
+        {
+            offset_in<Ts>(archetype.types)...,
+        });
+  }
+
+  template <class... Ts> entity_t insert(Ts &&...ts) {
     constexpr std::size_t N = sizeof(std::tuple<Ts...>);
     std::array<std::byte, N> data;
     auto types = as_type_set<Ts...>();
@@ -301,23 +347,32 @@ public:
         }(),
         ...);
 
-    auto &archetype = find_or_insert_archetype(
+    const std::size_t archetype_idx = find_or_insert_archetype_idx(
         as_type_set<Ts...>(), {sizeof(data), alignof(decltype(data))});
-    archetype.insert(data);
+
+    auto &archetype = archetypes_[archetype_idx];
+    const auto idx = archetype.insert(data);
+
+    return entity_info{
+        .generation = 0,
+        .archetype = static_cast<uint16_t>(archetype_idx),
+        .idx = static_cast<uint32_t>(idx),
+    }
+        .into_entity_t();
   }
 
   /* private: */
   std::vector<archetype> archetypes_;
 
-  archetype &find_or_insert_archetype(type_set types, type_info tinfo) {
-    for (auto &archetype : archetypes_) {
-      if (archetype.types == types) {
-        return archetype;
+  std::size_t find_or_insert_archetype_idx(type_set types, type_info tinfo) {
+    for (std::size_t i = 0; i < archetypes_.size(); i++) {
+      if (archetypes_[i].types == types) {
+        return i;
       }
     }
 
     archetypes_.emplace_back(types, tinfo);
-    return archetypes_.back();
+    return archetypes_.size() - 1;
   }
 
   template <class... Ts> constexpr type_set as_type_set() {
@@ -340,13 +395,14 @@ public:
   }
 };
 
-template <class T> struct basic_world_from_list {};
-template <class... Tn> struct basic_world_from_list<nostd::typelist<Tn...>> {
-  using type = basic_world<StaticRegistry<Tn...>>;
+template <class T> struct static_registry_from_list {};
+template <class... Tn>
+struct static_registry_from_list<nostd::typelist<Tn...>> {
+  using type = StaticRegistry<Tn...>;
 };
 
 template <class T>
-using basic_world_from_list_t = basic_world_from_list<T>::type;
+using static_registry_from_list_t = static_registry_from_list<T>::type;
 } // namespace ecs
 
 namespace components {
@@ -368,25 +424,32 @@ struct another_thing {
 using components = nostd::typelist<pos, speed, another_thing>;
 } // namespace components
 
-using World = ecs::basic_world_from_list_t<components::components>;
+using World =
+    ecs::basic_world<ecs::static_registry_from_list_t<components::components>>;
 using DynamicWorld = ecs::basic_world<ecs::DynamicRegistry<8>>;
 
 int main() {
   DynamicWorld world;
 
   nostd::println("World is {}", nostd::type_name<World>());
-  for (size_t i = 0; i < 1024; i++) {
-    world.insert<components::speed, components::another_thing, components::pos>(
-        {.pos = {.x = static_cast<float>(i), .y = 0}}, {}, {});
-  }
 
-  nostd::println("Offset of speed in archetype<components::speed, "
-                 "components::another_thing, components::pos>: {}",
-                 world.offset_in<components::speed>(world.archetypes_[0].types),
-                 sizeof(components::speed));
+  ecs::entity_t ent254;
+  for (size_t i = 0; i < 1024; i++) {
+    const ecs::entity_t ent = world.insert<components::speed, components::pos>(
+        {.pos = {.x = static_cast<float>(i), .y = 2}}, {.pos={2, 4}});
+
+    if (i == 254) {
+      ent254 = ent;
+    }
+  }
 
   for (const auto &[speed, pos] :
        world.query<components::speed, components::pos>()) {
     nostd::println("speed: {}, {}", speed.pos.x, pos.pos.x);
+  }
+  {
+    const auto &[speed, pos] =
+        world.entity<components::speed, components::pos>(ent254);
+    nostd::println("ent254: speed: {}, {}", speed.pos.x, pos.pos.x);
   }
 }
