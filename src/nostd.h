@@ -121,4 +121,9 @@ void static_for(std::integer_sequence<T, ints...>, Fn &&f) {
 };
 } // namespace nostd
 #define INLINE_LAMBDA nostd::inline_lambda{} + [&]()
+
+#ifdef TIMED_INLINE_LAMBDA_DISABLE
+#define TIMED_INLINE_LAMBDA(name) nostd::inline_lambda{} + [&]()
+#else
 #define TIMED_INLINE_LAMBDA(name) nostd::timed_inline_lambda{(name)} + [&]()
+#endif

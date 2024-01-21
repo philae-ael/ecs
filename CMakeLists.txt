@@ -25,3 +25,5 @@ target_link_libraries(ecs PRIVATE $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main> $<IF:$
 # set_property(TARGET ecs PROPERTY CXX_INCLUDE_WHAT_YOU_USE "iwyu-tool")
 
 target_compile_options(ecs PRIVATE -Wall -Wextra -fdiagnostics-color=always -ggdb -march=native)
+# target_compile_options(ecs PRIVATE -fsanitize=address)
+# target_link_options(ecs PRIVATE -fsanitize=address)
