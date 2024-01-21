@@ -1,4 +1,7 @@
+
+#define TIMED_INLINE_LAMBDA_DISABLE
 #include "ecs.h"
+
 #include "nostd.h"
 #include <SDL_events.h>
 #include <SDL_rect.h>
@@ -182,8 +185,8 @@ int main() {
     std::abort();
   }
 
-  /* ecs::basic_world<ecs::static_registry_from_list_t<components::list>> world{}; */
-  ecs::DynamicWorld world{};
+  ecs::basic_world<ecs::static_registry_from_list_t<components::list>> world{};
+  /* ecs::DynamicWorld world{}; */
   Renderer renderer = INLINE_LAMBDA {
     auto renderer = Renderer::init();
     if (!renderer) {
@@ -193,7 +196,7 @@ int main() {
   };
 
   ParticleManager particles{};
-  particles.create_particles(world, 4 * 4 * 1024);
+  particles.create_particles(world, 256 * 1024);
 
   float dt = 0.0;
   auto last = std::chrono::high_resolution_clock::now();
@@ -217,6 +220,7 @@ int main() {
     const auto previous =
         std::exchange(last, std::chrono::high_resolution_clock::now());
     dt = std::chrono::duration_cast<fsec>(last - previous).count();
+    nostd::println("FPS: {:.1f} \t|\t{:.2f}us", 1.0 / dt, 1000.*1000.*dt);
   }
 
   SDL_Quit();

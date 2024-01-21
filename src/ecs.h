@@ -11,6 +11,7 @@
 #include <typeindex>
 #include <vector>
 
+#include "hive.h"
 #include "nostd.h"
 
 namespace ecs {
@@ -20,7 +21,7 @@ enum class entity_t : uint64_t {};
 struct entity_info {
   uint16_t generation;
   uint16_t archetype;
-  uint32_t idx;
+  hive_index_t idx;
 
   entity_t into_entity_t() { return std::bit_cast<entity_t>(*this); }
   static entity_info from_entity_t(entity_t ent) {
@@ -39,45 +40,23 @@ struct type_info {
 template <const std::size_t N> struct Archetype {
   std::bitset<N> types;
   type_info tinfo;
-  std::size_t size = 0;
-  std::size_t capacity = 4 * 4 * 1024;
 
-  std::byte *data;
+  hive data;
 
   Archetype(std::bitset<N> types, type_info tinfo)
-      : types(types), tinfo(tinfo), data(new(std::align_val_t(tinfo.alignement))
-                                             std::byte[capacity * tinfo.size]) {
+      : types(types), tinfo(tinfo), data(tinfo.size) {}
+
+  hive_index_t insert(std::span<const std::byte> src) {
+    auto [idx, d] = data.create();
+    std::copy(src.begin(), src.end(), d);
+
+    return idx;
   }
 
-  std::size_t insert(std::span<const std::byte> src) {
-    assert(src.size_bytes() == tinfo.size);
-    auto dst = at(size);
-    std::copy(src.begin(), src.end(), dst.begin());
-    ++size;
+  std::span<std::byte> at(hive_index_t index) { return data.get(index); }
 
-    return size - 1;
-  }
-
-  ~Archetype() { delete[] data; }
-
-  std::span<std::byte> at(std::size_t index) {
-    assert(index < capacity);
-    return {data + index * tinfo.size, tinfo.size};
-  }
-
-  void remove(size_t idx) {
-    assert(idx < size);
-    swap(idx, size - 1);
-    size -= 1;
-  }
-  void swap(size_t idx1, size_t idx2) {
-    if (idx1 == idx2) {
-      return;
-    }
-    std::swap_ranges(at(idx1).begin(), at(idx1).end(), at(idx2).begin());
-  }
-  auto begin() { return data; }
-  auto end() { return data + size * tinfo.size; }
+  auto begin() { return data.end(); }
+  auto end() { return data.begin(); }
 };
 
 template <class... Ts> struct entity_getter {
@@ -115,11 +94,10 @@ template <class World, class... Ts> class query_iterator {
     archetypes_vector_iterator archetypes_vector_cur;
     archetypes_vector_iterator archetypes_vector_end;
 
-    std::byte *archetype_cur;
-    std::byte *archetype_end;
+    hive_iterator archetype_cur;
+    hive_iterator archetype_end;
 
     std::array<std::size_t, sizeof...(Ts)> offsets;
-    std::size_t stride;
     World *world;
 
     friend inline auto operator==(const M &a, const M &b) {
@@ -140,22 +118,20 @@ public:
       return;
     }
 
-    m.stride = m.archetypes_vector_cur->tinfo.size;
     m.offsets = {
         m.world->template offset_in<Ts>(m.archetypes_vector_cur->types)...};
     m.archetype_cur = m.archetypes_vector_cur->begin();
     m.archetype_end = m.archetypes_vector_cur->end();
   }
 
-  inline query_iterator &operator++() {
-    m.archetype_cur += m.stride;
+  query_iterator &operator++() {
+    ++m.archetype_cur;
     if (m.archetype_cur != m.archetype_end) {
       return *this;
     }
 
     ++m.archetypes_vector_cur;
     find_next_archetype();
-
     return *this;
   }
 
@@ -167,10 +143,10 @@ public:
 
   inline std::tuple<Ts &...> operator*() { return next(); }
   inline std::tuple<Ts &...> next() {
-    return entity_getter<Ts...>::from_data_offsets(m.archetype_cur, m.offsets);
+    return entity_getter<Ts...>::from_data_offsets(*m.archetype_cur, m.offsets);
   }
   inline std::tuple<Ts *...> next_ptr() {
-    return entity_ptr_getter<Ts...>::from_data_offsets(m.archetype_cur,
+    return entity_ptr_getter<Ts...>::from_data_offsets(*m.archetype_cur,
                                                        m.offsets);
   }
 
@@ -180,13 +156,7 @@ public:
   query_iterator begin() { return *this; }
   query_iterator end() {
     return M{
-        m.types,
-        m.archetypes_vector_end,
-        m.archetypes_vector_end,
-        nullptr,
-        nullptr,
-        {},
-        0,
+        m.types, m.archetypes_vector_end, m.archetypes_vector_end, {}, {}, {},
         m.world,
     };
   }
@@ -293,7 +263,7 @@ public:
     return entity_info{
         .generation = 0,
         .archetype = static_cast<uint16_t>(archetype_idx),
-        .idx = static_cast<uint32_t>(idx),
+        .idx = idx,
     }
         .into_entity_t();
   }
